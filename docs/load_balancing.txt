@@ -1,0 +1,43 @@
+Load Balancing: Algorithms, Architecture, and Best Practices
+
+A load balancer is a component that distributes incoming network requests across a pool of backend servers. Its primary goals are to maximize throughput, minimize response time, avoid overloading any single server, and provide high availability by routing around failed backends. Load balancers operate at different layers of the network stack: Layer 4 (transport-level TCP/UDP) and Layer 7 (application-level HTTP/gRPC).
+
+Layer 4 vs Layer 7 Load Balancing
+
+Layer 4 load balancers make routing decisions based on IP addresses and TCP port numbers without inspecting the content of packets. They are extremely fast and can handle millions of connections per second. HAProxy in TCP mode and AWS NLB (Network Load Balancer) are common Layer 4 solutions. Layer 7 load balancers inspect the HTTP request—URL path, headers, cookies, body—and can route based on application-level semantics. For example, a Layer 7 load balancer can route /api/v1/* to one set of backends and /api/v2/* to another. nginx, HAProxy in HTTP mode, Traefik, and AWS ALB (Application Load Balancer) are Layer 7 solutions. Modern service meshes like Istio and Linkerd embed Layer 7 load balancing as a sidecar proxy alongside every service.
+
+Round Robin
+
+Round Robin is the simplest load balancing algorithm. The load balancer maintains an ordered list of backends and forwards each new request to the next backend in the list, cycling back to the first after reaching the last. Round Robin ensures an even distribution of request count across backends, but not necessarily an even distribution of work, because different requests may require very different processing times. Weighted Round Robin assigns a weight to each backend, routing proportionally more requests to higher-capacity servers.
+
+Least Connections
+
+Least Connections routes each new request to the backend with the fewest currently active connections (in-flight requests). This is better than Round Robin for workloads with variable request duration because it naturally avoids sending requests to a backend that is already busy handling many long-running requests. Weighted Least Connections adjusts the connection count by each backend's capacity weight. Least Connections works well for protocols like HTTP/1.1 where connections are persistent, and for gRPC where a single connection can multiplex many RPC calls.
+
+Load-Aware Routing
+
+Load-aware routing (also called resource-aware routing) incorporates live performance metrics rather than just connection counts. Metrics may include CPU utilization, memory pressure, request queue depth, or recent average response latency. The load balancer periodically polls each backend for its current metrics and computes a composite "load score." A common formula is: score = (active_connections + 1) * (avg_latency + epsilon), where epsilon prevents division by zero for fresh backends. The backend with the lowest score receives the next request. This strategy adapts dynamically to heterogeneous backends and workload spikes.
+
+Consistent Hashing for Stateful Backends
+
+For stateful workloads—like LLM inference with a KV cache, or user session data cached in memory—it is advantageous to route requests from the same user to the same backend, so the relevant state is already warm. Consistent hashing achieves this by mapping each request's key (e.g., session ID, user ID) to a position on a hash ring, then routing to the backend closest to that position. When backends are added or removed, only a fraction of keys need to be remapped. This is preferable to simple modular hashing (key % num_backends), which remaps all keys when the backend count changes.
+
+Health Checking and Circuit Breakers
+
+A load balancer must detect and route around unhealthy backends. Active health checks periodically send probe requests (like HTTP GET /health) to each backend and mark backends that fail to respond or return error status codes as unhealthy. Passive health checks monitor live traffic: if a backend returns a configurable number of consecutive errors or timeouts, it is temporarily removed from rotation. Circuit breakers (popularized by Netflix's Hystrix) implement a state machine: CLOSED (normal), OPEN (backend removed from pool after failures), and HALF-OPEN (a probe request is sent after a cooldown to test recovery). This prevents a slow backend from absorbing requests indefinitely.
+
+Retry Logic and Timeouts
+
+When a backend returns an error or a connection times out, the load balancer can retry the request on a different backend. Idempotent requests (GET, HEAD, safe POST calls) are safe to retry. Non-idempotent requests (state-changing POSTs, payment transactions) must be retried only with idempotency keys to avoid duplicate operations. Exponential backoff with jitter is the standard retry strategy: after each failure, wait 2^attempt * base_delay + random_jitter before retrying, capped at a max delay. This prevents the "thundering herd" problem where thousands of clients retry simultaneously after a partial outage.
+
+Rate Limiting and Admission Control
+
+Load balancers can enforce rate limits to protect backends from being overwhelmed. Token bucket rate limiting allows a burst of up to N requests and refills tokens at a fixed rate. Leaky bucket smooths bursts into a constant output rate. In distributed deployments, a centralized rate limit counter (stored in Redis) can enforce per-user or per-IP limits consistently across multiple load balancer instances. Admission control takes this further by shedding load proactively when the system detects it is approaching saturation, returning 503 Service Unavailable before backends start failing.
+
+Connection Pooling
+
+Establishing a new TCP connection requires a three-way handshake and, for HTTPS, a TLS handshake—adding tens of milliseconds of latency. Connection pooling maintains a pool of pre-established connections to each backend, reusing them across requests. Most HTTP clients (like httpx in Python) support connection pooling transparently. At the load balancer level, persistent connections reduce both latency and CPU overhead from connection setup. HTTP/2 and HTTP/3 (QUIC) multiplex many requests over a single connection, eliminating the need for large connection pools.
+
+Global Server Load Balancing
+
+For globally distributed deployments, Geographic DNS routing directs users to the nearest data center based on their IP address. Anycast routing assigns the same IP to multiple data centers and relies on BGP routing to deliver packets to the nearest one. Systems like AWS Route53 Latency Routing and Cloudflare load balancers combine health checking with geography to route users to the fastest healthy data center. Failover policies automatically redirect traffic from a failed region to a healthy one within seconds.

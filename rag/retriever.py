@@ -1,97 +1,158 @@
 """
-Real RAG retriever using sentence-transformers + cosine similarity.
+RAG Retriever — query the persisted vector index.
 
-How it works:
-  1. On first use, load `all-MiniLM-L6-v2` (~80MB, 384-dim embeddings)
-     and embed every document in `knowledge_base.DOCUMENTS` into a matrix.
-  2. For each query, embed the query into the same 384-dim space.
-  3. Compute cosine similarity between the query vector and every
-     document vector. Pick the top-k highest-scoring documents.
-  4. Concatenate them into one context string for the LLM.
+On the first call to retrieve_context(), this module:
+  1. Loads the sentence-transformer embedding model (once per process).
+  2. Loads the NearestNeighbors index and chunk list from disk
+     (built by running `python ingest.py`).
 
-Why this design:
-  - The embedding model is small and CPU-fast (~10ms per query).
-  - We embed the KB exactly once at load time, then every retrieval is
-    a single matrix-vector multiplication: O(num_docs * dim). For ~20
-    docs that's effectively instant. For 100k+ docs you'd swap this for
-    FAISS, but the *interface* would stay identical.
-  - Lazy loading + double-checked locking, same pattern as llm/inference.py,
-    so import is cheap and the model loads exactly once across all threads.
+Every subsequent call is a fast in-memory query:
+  • Embed the query (~10ms on CPU for all-MiniLM-L6-v2)
+  • kNN search over the indexed embeddings (~1ms for a few hundred chunks)
+  • Return the top-k chunks formatted as context for the LLM
+
+Thread safety
+-------------
+The embedding model and index are loaded behind a double-checked lock so
+they are initialised exactly once even when many worker threads call
+retrieve_context() simultaneously on startup.
 """
 
 import threading
 import time
+from typing import List
+
 import numpy as np
 
-from rag.knowledge_base import DOCUMENTS
+from rag.indexer import load_index, index_exists
 
 _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-_model = None
-_doc_embeddings = None        # shape: (num_docs, 384)
+# Module-level singletons — set once, never replaced
+_model  = None
+_nn     = None     # sklearn NearestNeighbors fitted on indexed embeddings
+_chunks = None     # list of (chunk_text, metadata)
+
 _load_lock = threading.Lock()
 
 
-def _ensure_loaded():
-    """Load the embedding model and embed the KB once."""
-    global _model, _doc_embeddings
-    if _model is not None:
-        return
-    with _load_lock:
-        if _model is not None:
-            return
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:
-            raise RuntimeError(
-                "sentence-transformers is not installed. Run:\n"
-                "  pip install sentence-transformers"
-            ) from e
-
-        print(f"[RAG] Loading {_MODEL_NAME} (first call only)...")
-        t0 = time.time()
-        _model = SentenceTransformer(_MODEL_NAME)
-        # Embed all KB documents up front. normalize_embeddings=True means
-        # each vector has unit length, which makes cosine similarity equal
-        # to a plain dot product (faster + simpler).
-        _doc_embeddings = _model.encode(
-            DOCUMENTS,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
-        print(
-            f"[RAG] Indexed {len(DOCUMENTS)} docs "
-            f"into {_doc_embeddings.shape} in {time.time() - t0:.1f}s"
-        )
-
+# =========================================================================
+# Public API
+# =========================================================================
 
 def retrieve_context(query: str, top_k: int = 3) -> str:
-    """Return the top-k most relevant KB documents as a single context string.
+    """
+    Return the top-k most relevant document chunks as a context string.
+
+    The context is formatted as a bulleted list with source attribution:
+        - [filename.txt] (relevance: 0.92) chunk text …
+
+    This format is fed directly into the LLM prompt.
 
     Args:
-        query: the user's question.
-        top_k: how many documents to include in the context.
+        query:  the user's natural-language question
+        top_k:  number of chunks to retrieve (default: 3)
 
     Returns:
-        A newline-separated string of the top-k documents, prefixed for
-        clarity. If something goes wrong, returns an empty string so the
-        LLM can still attempt a (less grounded) answer.
+        Formatted context string, or empty string on error.
     """
-    _ensure_loaded()
+    try:
+        _ensure_loaded()
+    except Exception as exc:
+        print(f"[RAG] Failed to load index: {exc}")
+        return ""
 
-    # Embed the query into the same vector space as the KB.
+    # --- Embed the query ---
     query_vec = _model.encode(
         [query],
         normalize_embeddings=True,
         convert_to_numpy=True,
-    )[0]   # shape: (384,)
+    ).astype(np.float32)    # shape: (1, dim)
 
-    # Cosine similarity = dot product, because both sides are unit-normalized.
-    # Result shape: (num_docs,)
-    scores = _doc_embeddings @ query_vec
+    # --- kNN search ---
+    # distances are cosine *distances* (0 = identical, 2 = opposite)
+    actual_k = min(top_k, len(_chunks))
+    distances, indices = _nn.kneighbors(query_vec, n_neighbors=actual_k)
 
-    # argsort returns indices low->high; we want top-k highest, so reverse.
-    top_indices = np.argsort(scores)[::-1][:top_k]
+    # --- Build context string ---
+    lines = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < 0 or idx >= len(_chunks):
+            continue
+        chunk_text, meta = _chunks[idx]
+        source = meta.get("source", "unknown")
+        similarity = round(1.0 - float(dist), 3)
+        lines.append(f"- [{source}] (relevance: {similarity}) {chunk_text}")
 
-    chosen = [DOCUMENTS[i] for i in top_indices]
-    return "\n".join(f"- {doc}" for doc in chosen)
+    return "\n".join(lines)
+
+
+def retrieve_with_scores(query: str, top_k: int = 3) -> List[dict]:
+    """
+    Return top-k chunks as a list of dicts — useful for debugging/evaluation.
+
+    Each dict: {"text": str, "source": str, "chunk_id": int, "score": float}
+    """
+    _ensure_loaded()
+
+    query_vec = _model.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    ).astype(np.float32)
+
+    actual_k = min(top_k, len(_chunks))
+    distances, indices = _nn.kneighbors(query_vec, n_neighbors=actual_k)
+
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        chunk_text, meta = _chunks[idx]
+        results.append({
+            "text": chunk_text,
+            "source": meta.get("source", "unknown"),
+            "chunk_id": meta.get("chunk_id", -1),
+            "score": round(1.0 - float(dist), 4),
+        })
+    return results
+
+
+# =========================================================================
+# Lazy loader — thread-safe double-checked locking
+# =========================================================================
+
+def _ensure_loaded():
+    """Load the embedding model and index exactly once per process."""
+    global _model, _nn, _chunks
+    if _model is not None:
+        return   # fast path
+
+    with _load_lock:
+        if _model is not None:
+            return   # another thread raced us and won
+
+        # Verify index exists before loading the heavy model
+        if not index_exists():
+            raise RuntimeError(
+                "Vector index not found.\n"
+                "Run `python ingest.py` first to build the index from docs/."
+            )
+
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "sentence-transformers is not installed.\n"
+                "Run: pip install sentence-transformers"
+            ) from exc
+
+        print(f"[RAG] Loading embedding model '{_MODEL_NAME}' …")
+        t0 = time.time()
+        _model = SentenceTransformer(_MODEL_NAME)
+
+        print("[RAG] Loading vector index from disk …")
+        _nn, _chunks = load_index()
+
+        print(
+            f"[RAG] Ready — {len(_chunks)} chunks indexed, "
+            f"loaded in {time.time() - t0:.1f}s"
+        )

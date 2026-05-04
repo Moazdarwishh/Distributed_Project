@@ -1,109 +1,273 @@
 """
-Load Balancer.
+Load Balancer — HTTP-based, real network requests.
 
-Holds a list of GPUWorkers and routes incoming requests to one of them
-according to a configurable strategy. Implements the three strategies
-required by the project spec:
+Architecture
+------------
+Instead of calling Python methods on in-process objects, this load
+balancer sends real HTTP POST requests to worker server processes via
+httpx.  Each remote worker is represented locally by a WorkerProxy that:
 
-    round_robin       - cycle through workers in order
-    least_connections - pick the worker with fewest in-flight requests
-    load_aware        - pick the worker with the lowest combined
-                        (in-flight count) * (recent average latency) score
+    • tracks health (via GET /health heartbeat)
+    • tracks in-flight request count (incremented/decremented locally)
+    • maintains a rolling average latency window (for load-aware routing)
+    • retries on failure and marks misbehaving workers unhealthy
 
-The load balancer also handles the *fault-tolerance* contract:
-  - Skip workers whose `is_healthy()` returns False.
-  - If a worker raises during process(), mark it unhealthy and retry on
-    a different worker so the request is not lost.
+The three routing strategies are unchanged from the simulation:
+
+    round_robin        — cycle through workers in order
+    least_connections  — pick the worker with fewest in-flight requests
+    load_aware         — pick the worker with the lowest expected wait:
+                         (active_requests + 1) * (avg_latency + ε)
+
+Fault tolerance
+---------------
+If a worker raises an exception or returns a non-200 status, the proxy
+marks it unhealthy and the dispatcher retries on the next healthy worker.
+The scheduler's heartbeat loop separately pings /health to detect silent
+failures (workers that died without the LB noticing mid-flight).
 """
 
-import threading
 import itertools
+import threading
+import time
+from collections import deque
+from typing import List, Optional
 
-from common.models import Response
+import httpx
 
+from common.models import Request, Response
+
+
+# ===========================================================================
+# WorkerProxy — one per remote HTTP worker
+# ===========================================================================
+
+class WorkerProxy:
+    """
+    Client-side proxy for one remote HTTP worker process.
+
+    Tracks health and load metrics locally so routing decisions are
+    O(1) without making extra HTTP calls.
+    """
+
+    def __init__(self, worker_id: int, url: str, timeout: float = 60.0):
+        self.id  = worker_id
+        self.url = url.rstrip("/")
+
+        # --- Health ---
+        self._healthy = True
+        self._health_lock = threading.Lock()
+
+        # --- Load metrics ---
+        self._active: int = 0
+        self._recent_latencies: deque = deque(maxlen=20)
+        self._metrics_lock = threading.Lock()
+
+        # Persistent HTTP client with connection pooling.
+        # A single Client is shared across all threads; httpx.Client is
+        # thread-safe as long as we don't mutate it after construction.
+        self._client = httpx.Client(timeout=timeout)
+
+    # -----------------------------------------------------------------------
+    # Health API
+    # -----------------------------------------------------------------------
+
+    def is_healthy(self) -> bool:
+        with self._health_lock:
+            return self._healthy
+
+    def mark_unhealthy(self):
+        with self._health_lock:
+            self._healthy = False
+        print(f"[Proxy {self.id}] marked UNHEALTHY ({self.url})")
+
+    def mark_healthy(self):
+        with self._health_lock:
+            self._healthy = True
+
+    def heartbeat(self) -> bool:
+        """
+        Ping GET /health.  Updates health state and returns True if alive.
+        Called periodically by the scheduler's background heartbeat thread.
+        """
+        try:
+            resp = self._client.get(f"{self.url}/health", timeout=3.0)
+            if resp.status_code == 200:
+                self.mark_healthy()
+                return True
+        except Exception as exc:
+            print(f"[Proxy {self.id}] heartbeat failed: {exc}")
+        self.mark_unhealthy()
+        return False
+
+    # -----------------------------------------------------------------------
+    # Load metrics API (read by routing strategies)
+    # -----------------------------------------------------------------------
+
+    def active_requests(self) -> int:
+        with self._metrics_lock:
+            return self._active
+
+    def avg_latency(self) -> float:
+        """Rolling average of the last 20 processed request latencies."""
+        with self._metrics_lock:
+            if not self._recent_latencies:
+                return 0.0
+            return sum(self._recent_latencies) / len(self._recent_latencies)
+
+    # -----------------------------------------------------------------------
+    # Main dispatch — sends a real HTTP request
+    # -----------------------------------------------------------------------
+
+    def process(self, request: Request) -> Response:
+        """
+        POST /process to the remote worker and return a Response.
+
+        Raises RuntimeError (caught by LoadBalancer.dispatch) on:
+            • worker is marked unhealthy before we even try
+            • HTTP error status (4xx / 5xx)
+            • network timeout or connection refused
+        """
+        if not self.is_healthy():
+            raise RuntimeError(f"Worker {self.id} at {self.url} is unhealthy")
+
+        with self._metrics_lock:
+            self._active += 1
+
+        wall_start = time.time()
+        try:
+            http_resp = self._client.post(
+                f"{self.url}/process",
+                json={"id": request.id, "query": request.query},
+            )
+            http_resp.raise_for_status()   # raises on 4xx / 5xx
+            data = http_resp.json()
+
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Worker {self.id} returned HTTP {exc.response.status_code}"
+            ) from exc
+
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            raise RuntimeError(
+                f"Worker {self.id} at {self.url} unreachable: {exc}"
+            ) from exc
+
+        finally:
+            with self._metrics_lock:
+                self._active -= 1
+
+        # Record wall-clock latency (includes network round-trip overhead)
+        wall_latency = time.time() - wall_start
+        with self._metrics_lock:
+            self._recent_latencies.append(wall_latency)
+
+        # Prefer the worker's own reported latency (pure compute time)
+        # for the Response object; fall back to wall-clock if missing.
+        reported_latency = data.get("latency", wall_latency)
+
+        return Response(
+            id=request.id,
+            result=data.get("result", ""),
+            latency=reported_latency,
+            worker_id=self.id,
+            success=data.get("success", True),
+            error=data.get("error"),
+        )
+
+    def close(self):
+        """Clean up the underlying httpx connection pool."""
+        self._client.close()
+
+    def __repr__(self):
+        status = "UP" if self.is_healthy() else "DOWN"
+        return (
+            f"WorkerProxy(id={self.id}, url={self.url}, "
+            f"status={status}, active={self.active_requests()}, "
+            f"avg_lat={self.avg_latency():.3f}s)"
+        )
+
+
+# ===========================================================================
+# LoadBalancer
+# ===========================================================================
 
 class LoadBalancer:
-    def __init__(self, workers, strategy: str = "round_robin"):
+    """
+    Routes requests to worker proxies using one of three strategies.
+
+    Args:
+        workers:   list of WorkerProxy instances (one per remote worker process)
+        strategy:  "round_robin" | "least_connections" | "load_aware"
+    """
+
+    def __init__(self, workers: List[WorkerProxy], strategy: str = "round_robin"):
         if not workers:
             raise ValueError("LoadBalancer needs at least one worker")
         if strategy not in ("round_robin", "least_connections", "load_aware"):
-            raise ValueError(f"Unknown strategy: {strategy}")
+            raise ValueError(f"Unknown strategy: '{strategy}'")
 
-        self.workers = workers
+        self.workers  = workers
         self.strategy = strategy
 
-        # Round-robin needs a shared counter that's safe across threads.
-        # itertools.cycle gives us "next index forever"; the lock makes
-        # incrementing it atomic so two threads can't grab the same worker.
         self._rr_iter = itertools.cycle(range(len(workers)))
         self._rr_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Strategy implementations
-    # ------------------------------------------------------------------
-    def _pick_round_robin(self):
-        """Cycle through workers; skip unhealthy ones."""
+    # -----------------------------------------------------------------------
+
+    def _pick_round_robin(self) -> Optional[WorkerProxy]:
         with self._rr_lock:
             for _ in range(len(self.workers)):
                 idx = next(self._rr_iter)
-                w = self.workers[idx]
+                w   = self.workers[idx]
                 if w.is_healthy():
                     return w
-        return None  # all workers down
-
-    def _pick_least_connections(self):
-        """Pick the healthy worker with the fewest in-flight requests."""
-        healthy = [w for w in self.workers if w.is_healthy()]
-        if not healthy:
-            return None
-        return min(healthy, key=lambda w: w.active_requests())
-
-    def _pick_load_aware(self):
-        """
-        Pick the healthy worker with the lowest "expected wait" score:
-            (active_requests + 1) * (avg_latency + small_epsilon)
-
-        The +1 stops a fresh worker (active=0) from being scored 0
-        regardless of its latency. The epsilon stops a worker with no
-        latency history from also scoring 0. The product approximates
-        the time a *new* request would have to wait.
-        """
-        healthy = [w for w in self.workers if w.is_healthy()]
-        if not healthy:
-            return None
-        return min(
-            healthy,
-            key=lambda w: (w.active_requests() + 1) * (w.avg_latency() + 1e-3),
-        )
-
-    def _pick(self):
-        """Strategy dispatch. Called once per dispatch attempt."""
-        if self.strategy == "round_robin":
-            return self._pick_round_robin()
-        if self.strategy == "least_connections":
-            return self._pick_least_connections()
-        if self.strategy == "load_aware":
-            return self._pick_load_aware()
-        # unreachable - validated in __init__
         return None
 
-    # ------------------------------------------------------------------
-    # Dispatch with retry-on-failure (the fault-tolerance core)
-    # ------------------------------------------------------------------
-    def dispatch(self, request, max_retries: int = 2):
-        """
-        Send a request to a worker, with up to `max_retries` failovers.
+    def _pick_least_connections(self) -> Optional[WorkerProxy]:
+        healthy = [w for w in self.workers if w.is_healthy()]
+        return min(healthy, key=lambda w: w.active_requests()) if healthy else None
 
-        On exception:
-          - mark the offending worker unhealthy
-          - re-pick using the same strategy (now from the smaller pool)
-          - retry the request
-
-        If we run out of healthy workers, return a failed Response so
-        the caller knows what happened (instead of raising up the stack
-        and crashing the load test).
+    def _pick_load_aware(self) -> Optional[WorkerProxy]:
         """
-        last_err = None
+        Pick the worker with the lowest estimated wait time:
+            (active_requests + 1) * (avg_latency + ε)
+
+        +1 prevents a fresh worker (active=0) from scoring 0 regardless of
+        latency.  ε prevents zero scoring when no latency history exists.
+        """
+        healthy = [w for w in self.workers if w.is_healthy()]
+        return (
+            min(healthy, key=lambda w: (w.active_requests() + 1) * (w.avg_latency() + 1e-3))
+            if healthy else None
+        )
+
+    def _pick(self) -> Optional[WorkerProxy]:
+        dispatch = {
+            "round_robin":       self._pick_round_robin,
+            "least_connections": self._pick_least_connections,
+            "load_aware":        self._pick_load_aware,
+        }
+        return dispatch[self.strategy]()
+
+    # -----------------------------------------------------------------------
+    # Dispatch with retry-on-failure
+    # -----------------------------------------------------------------------
+
+    def dispatch(self, request: Request, max_retries: int = 2) -> Response:
+        """
+        Send request to the best available worker, retrying on failures.
+
+        On each failure:
+          - The offending worker is marked unhealthy.
+          - The strategy picks the next best healthy worker.
+          - Up to max_retries+1 total attempts are made.
+
+        If all attempts fail, returns a failed Response (never raises).
+        """
+        last_err  = None
         tried_ids = set()
 
         for attempt in range(max_retries + 1):
@@ -112,24 +276,22 @@ class LoadBalancer:
                 last_err = "No healthy workers available"
                 break
 
-            # Avoid hitting the same worker twice in one dispatch (would
-            # be a guaranteed second failure if it's still broken).
             if worker.id in tried_ids:
-                # Round Robin will eventually cycle back here; for the
-                # other strategies the same worker may keep being "best"
-                # if everyone else just got marked dead.
+                # This worker already failed — don't retry it
+                # (may happen with round-robin when pool shrinks)
                 continue
             tried_ids.add(worker.id)
 
             try:
                 return worker.process(request)
-            except Exception as e:
-                last_err = f"worker {worker.id} failed: {e}"
+            except Exception as exc:
+                last_err = str(exc)
                 worker.mark_unhealthy()
-                # loop and try the next one
-                continue
+                print(
+                    f"[LB] attempt {attempt+1}/{max_retries+1} "
+                    f"failed on worker {worker.id}: {exc}"
+                )
 
-        # Exhausted retries -> return a failure Response, don't raise.
         return Response(
             id=request.id,
             result="",
@@ -138,3 +300,8 @@ class LoadBalancer:
             success=False,
             error=last_err or "dispatch failed",
         )
+
+    def close(self):
+        """Close all worker HTTP clients."""
+        for w in self.workers:
+            w.close()

@@ -1,0 +1,41 @@
+Distributed Systems: Architecture, Concepts, and Design Principles
+
+A distributed system is a collection of autonomous computers that are connected through a network and coordinate their actions by passing messages to achieve a common goal. From the user's perspective, the system behaves as a single coherent unit, even though it may consist of dozens or hundreds of independent machines running across different geographic locations.
+
+The fundamental motivation for distributed systems is scale. A single machine has hard limits on CPU, memory, and I/O throughput. By distributing work across many nodes, we can serve millions of users simultaneously, store petabytes of data, and achieve compute throughputs that no single machine could match. Modern cloud infrastructure—services like Amazon S3, Google Search, or Netflix streaming—are built entirely on distributed principles.
+
+CAP Theorem
+
+The CAP theorem, proved by Eric Brewer in 2000, states that any distributed system can guarantee at most two of the following three properties simultaneously: Consistency (every read receives the most recent write), Availability (every request receives a response), and Partition tolerance (the system continues to function when network partitions occur). Since network partitions are unavoidable in real systems, the practical choice is between consistency and availability. Systems like HBase and Zookeeper favor consistency (CP), while systems like CouchDB and Cassandra favor availability (AP).
+
+Consensus Algorithms
+
+Getting distributed nodes to agree on a single value despite failures is the consensus problem. The Paxos algorithm, designed by Leslie Lamport, was the first widely adopted solution. Raft, designed for understandability, divides consensus into leader election and log replication phases. In Raft, one node serves as leader and replicates entries to followers; if the leader fails, a new election happens automatically. Practical Byzantine Fault Tolerance (PBFT) handles a stronger threat model where nodes can act maliciously.
+
+Replication Strategies
+
+Replication is the practice of storing copies of data on multiple nodes to improve durability and availability. In synchronous replication, the primary waits for acknowledgment from replicas before confirming a write to the client. This guarantees no data loss but increases write latency. In asynchronous replication, the primary returns to the client immediately and replicates in the background. This reduces write latency but risks losing recent writes if the primary fails before replicating. Quorum-based replication (used by Dynamo-style systems) requires writes to succeed on W nodes and reads to consult R nodes, where W + R > N (total replicas) to guarantee consistency.
+
+Distributed Hashing and Sharding
+
+Sharding divides a large dataset into smaller partitions (shards) distributed across nodes. Consistent hashing is a technique that maps both data keys and nodes onto a circular hash ring, minimizing redistribution when nodes join or leave. Virtual nodes (vnodes) improve load balance by assigning each physical node multiple positions on the ring. Apache Cassandra and Amazon DynamoDB use consistent hashing to distribute data without a central coordinator.
+
+Two-Phase Commit and Distributed Transactions
+
+When a transaction spans multiple nodes, coordination is required to ensure atomicity (either all nodes commit or none do). Two-Phase Commit (2PC) involves a coordinator sending a PREPARE message to all participants, waiting for votes, and then sending COMMIT or ABORT. 2PC is blocking: if the coordinator crashes after PREPARE but before COMMIT, participants are stuck waiting indefinitely. Three-Phase Commit (3PC) adds a pre-commit phase to address this but is still vulnerable to network partitions. Modern distributed databases often use optimistic concurrency control or Multi-Version Concurrency Control (MVCC) to avoid distributed locking entirely.
+
+Message Passing and Event-Driven Architecture
+
+Distributed components communicate via message passing. Synchronous RPC (remote procedure call) makes a call and waits for a result, creating temporal coupling. Asynchronous messaging decouples producers from consumers using queues (like Apache Kafka or RabbitMQ). In event-driven architectures, components publish events to a shared bus and interested services subscribe. Kafka provides durable, ordered, partitioned logs that can be replayed, enabling event sourcing and CQRS patterns. Exactly-once semantics in distributed messaging requires idempotent consumers and transactional producers.
+
+Service Discovery and Coordination
+
+As clusters grow dynamically, services need to discover each other without hardcoded addresses. DNS-based service discovery (used in Kubernetes) maps service names to IP addresses automatically. Consul and Etcd provide distributed key-value stores where services register their endpoints. ZooKeeper provides distributed locks, leader election, and configuration management. Kubernetes extends this with pod scheduling, autoscaling, health checking, and rolling deployments managed by a control plane.
+
+Distributed Clocks and Time
+
+In a distributed system, there is no global clock. Network Time Protocol (NTP) synchronizes clocks to within a few milliseconds but cannot guarantee strict ordering. Lamport timestamps provide logical ordering: each process maintains a counter incremented on each event, and messages carry the sender's timestamp, with the receiver advancing its own counter to max(local, received) + 1. Vector clocks extend this to track causal relationships between events across multiple processes. Google's TrueTime API (used in Spanner) bounds clock uncertainty using GPS and atomic clocks, enabling globally consistent serializable transactions.
+
+Observability in Distributed Systems
+
+Debugging distributed systems is hard because failures are partial and non-deterministic. The three pillars of observability are metrics (aggregated numerical time-series like latency percentiles and error rates), logs (structured records of individual events), and traces (end-to-end records of a request's journey across services). Distributed tracing tools like Jaeger and Zipkin propagate a trace ID through all service calls, allowing engineers to reconstruct the full path of any request and identify where latency was introduced. The OpenTelemetry standard provides vendor-neutral instrumentation APIs for all three pillars.

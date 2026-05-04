@@ -1,88 +1,205 @@
 """
-Main entry point for the distributed LLM serving system.
+Main entry point — Real Distributed RAG System.
 
-Wires together:
-    GPUWorker(s)  ->  LoadBalancer  ->  Scheduler  ->  client load test
+Architecture
+------------
+         ┌─────────────────────────────────────────┐
+         │            Client (load test)            │
+         │  ThreadPoolExecutor → Scheduler          │
+         └───────────────────┬─────────────────────┘
+                             │ handle_request()
+                    ┌────────▼────────┐
+                    │   Scheduler     │  ← background heartbeat
+                    │  (metrics +     │    pings /health on each worker
+                    │   heartbeat)    │
+                    └────────┬────────┘
+                             │ dispatch()
+                    ┌────────▼────────┐
+                    │  Load Balancer  │  round_robin | least_connections
+                    │  (HTTP client)  │  | load_aware
+                    └──┬──────┬──┬───┘
+                       │      │  │  real HTTP POST /process
+              ┌────────▼─┐ ┌──▼──┴──┐ ┌──▼────────┐
+              │ Worker 0 │ │Worker 1 │ │ Worker N  │
+              │:8001     │ │:8002    │ │:800(N+1)  │
+              └────┬─────┘ └──┬──────┘ └──┬────────┘
+                   │          │            │
+              ┌────▼──────────▼────────────▼────┐
+              │  RAG Retriever (FAISS/sklearn)   │
+              │  → sentence-transformers         │
+              │  → rag/embeddings.npy (disk)     │
+              └──────────────┬───────────────────┘
+                             │ context
+              ┌──────────────▼───────────────────┐
+              │  LLM: flan-t5-small (CPU)         │
+              │  → transformers + torch           │
+              └──────────────────────────────────┘
 
-Edit the CONFIG block below to run different experiments without
-changing any other file. Each experiment in your project report can be
-reproduced by setting these knobs and re-running this script.
+Each worker is a real OS process running a ThreadingHTTPServer.
+The load balancer talks to them over real TCP sockets on localhost.
+
+=============================================================================
+CONFIG — edit these to run different experiments
+=============================================================================
 """
 
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
-from workers.gpu_worker import GPUWorker
-from lb.load_balancer import LoadBalancer
+import httpx
+
+from lb.load_balancer import LoadBalancer, WorkerProxy
 from master.scheduler import Scheduler
 from client.load_generator import run_load_test
 
+# ─── How many independent worker server processes to spawn ───────────────────
+NUM_WORKERS      = 4
 
-# =============================================================================
-# CONFIG — change these to run different experiments.
-# =============================================================================
+# ─── Base port: workers listen on BASE_PORT, BASE_PORT+1, … ─────────────────
+BASE_PORT        = 8001
 
-# How many simulated GPU nodes. More workers => more parallelism, but
-# each worker still serializes its own LLM calls behind a lock, so the
-# real ceiling is set by your CPU.
-NUM_WORKERS = 4
+# ─── Load test parameters ────────────────────────────────────────────────────
+NUM_USERS        = 100        # total requests to fire
+MAX_CONCURRENCY  = 20         # max simultaneous in-flight HTTP requests
 
-# How many concurrent users to simulate.
-# Project spec asks for 100 -> 1000 progression. Start small while
-# debugging, then bump up for the headline number in the report.
-NUM_USERS = 1000
+# ─── Which routing strategy to use ───────────────────────────────────────────
+#     Options: "round_robin" | "least_connections" | "load_aware"
+STRATEGY         = "load_aware"
 
-# Cap on simultaneous in-flight requests. Real production load balancers
-# also queue beyond this. Keep it well below NUM_USERS to actually test
-# queueing behavior.
-MAX_CONCURRENCY = 135
-
-# Which load-balancing strategy to use this run.
-# Options: "round_robin" | "least_connections" | "load_aware"
-STRATEGY = "load_aware"
-
-# If True, kill one worker partway through the test to demonstrate
-# fault tolerance: dispatch should retry on a healthy worker, the load
-# test should still report 0 failures, and the per-worker breakdown
-# should show the killed worker handled fewer requests than the others.
+# ─── Fault-tolerance demo: kill one worker mid-test ──────────────────────────
 SIMULATE_FAILURE = True
-FAILURE_DELAY_S = 2.0      # how long after the test starts before we kill
-FAILURE_VICTIM_ID = 1      # which worker id to kill
+FAILURE_DELAY_S  = 8.0        # seconds after load test starts
+FAILURE_VICTIM   = 1          # which worker index (0-based) to kill
+
+# ─── Scheduler heartbeat interval ────────────────────────────────────────────
+HEARTBEAT_S      = 5.0
 
 # =============================================================================
 
 
-def schedule_failure(workers, delay: float, victim_id: int):
-    """Spawn a daemon thread that kills one worker after `delay` seconds."""
+def wait_for_workers(urls: list, timeout: float = 120.0):
+    """
+    Block until all workers respond to GET /health, or raise RuntimeError.
+
+    Uses a short poll loop with exponential backoff so we don't spam
+    the workers during their startup phase (model loading can take 30s+).
+    """
+    deadline = time.time() + timeout
+    pending  = set(urls)
+    delay    = 0.5
+
+    print(f"[Main] Waiting for {len(urls)} worker(s) to become healthy …")
+    while pending and time.time() < deadline:
+        for url in list(pending):
+            try:
+                r = httpx.get(f"{url}/health", timeout=2.0)
+                if r.status_code == 200:
+                    print(f"  [✓] {url}")
+                    pending.discard(url)
+            except Exception:
+                pass
+        if pending:
+            time.sleep(min(delay, 3.0))
+            delay *= 1.2
+
+    if pending:
+        raise RuntimeError(
+            f"Workers did not become healthy in {timeout}s: {pending}"
+        )
+
+    print("[Main] All workers are healthy.\n")
+
+
+def _schedule_failure(procs: list, delay: float, victim_idx: int):
+    """Spawn a daemon thread that terminates one worker process after `delay` s."""
     def _kill():
         time.sleep(delay)
-        print(f"\n!!! [FailureSim] Killing worker {victim_id} !!!\n")
-        workers[victim_id].simulate_failure()
+        proc = procs[victim_idx]
+        if proc.poll() is None:   # still running
+            print(f"\n!!! [FailureSim] Terminating worker {victim_idx} "
+                  f"(pid={proc.pid}) !!!\n")
+            proc.terminate()
 
-    threading.Thread(target=_kill, daemon=True).start()
+    threading.Thread(target=_kill, daemon=True, name="failure-sim").start()
 
 
 def main():
-    print("=" * 60)
-    print(f"  Distributed LLM Serving — strategy={STRATEGY}")
-    print(f"  workers={NUM_WORKERS}, users={NUM_USERS}, "
-          f"concurrency<={MAX_CONCURRENCY}")
-    print("=" * 60)
+    # ------------------------------------------------------------------
+    # 0. Verify the vector index exists
+    # ------------------------------------------------------------------
+    from rag.indexer import index_exists
+    if not index_exists():
+        print(
+            "ERROR: RAG vector index not found.\n"
+            "Run `python ingest.py` first to build the index from docs/.\n"
+        )
+        sys.exit(1)
 
-    # 1. Build the simulated GPU cluster.
-    workers = [GPUWorker(worker_id=i) for i in range(NUM_WORKERS)]
+    print("=" * 62)
+    print(f"  Real Distributed RAG System")
+    print(f"  strategy={STRATEGY}, workers={NUM_WORKERS}, "
+          f"users={NUM_USERS}, concurrency≤{MAX_CONCURRENCY}")
+    print("=" * 62 + "\n")
 
-    # 2. Put a load balancer in front of them.
-    lb = LoadBalancer(workers, strategy=STRATEGY)
+    # ------------------------------------------------------------------
+    # 1. Spawn worker server processes
+    # ------------------------------------------------------------------
+    python_bin  = sys.executable
+    worker_procs = []
+    worker_urls  = []
 
-    # 3. Put the master scheduler in front of the load balancer.
-    scheduler = Scheduler(lb, heartbeat_interval=2.0)
+    for i in range(NUM_WORKERS):
+        port = BASE_PORT + i
+        url  = f"http://localhost:{port}"
+        proc = subprocess.Popen(
+            [
+                python_bin, "-m", "workers.worker_server",
+                "--port",      str(port),
+                "--worker-id", str(i),
+            ],
+            # Route worker stdout/stderr to the parent terminal so you can
+            # see model loading logs.  Comment these out for silent runs.
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        worker_procs.append(proc)
+        worker_urls.append(url)
+        print(f"[Main] Spawned worker {i} on port {port} (pid={proc.pid})")
 
-    # 4. (Optional) schedule a worker-kill to test fault tolerance.
+    # ------------------------------------------------------------------
+    # 2. Wait for all workers to be ready
+    # ------------------------------------------------------------------
+    try:
+        wait_for_workers(worker_urls, timeout=180.0)
+    except RuntimeError as exc:
+        print(f"\nERROR: {exc}")
+        for p in worker_procs:
+            p.terminate()
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # 3. Build the distributed system components
+    # ------------------------------------------------------------------
+    proxies   = [WorkerProxy(worker_id=i, url=u) for i, u in enumerate(worker_urls)]
+    lb        = LoadBalancer(proxies, strategy=STRATEGY)
+    scheduler = Scheduler(lb, heartbeat_interval=HEARTBEAT_S)
+
+    # ------------------------------------------------------------------
+    # 4. (Optional) schedule a worker kill to test fault tolerance
+    # ------------------------------------------------------------------
     if SIMULATE_FAILURE:
-        schedule_failure(workers, FAILURE_DELAY_S, FAILURE_VICTIM_ID)
+        print(
+            f"[Main] Fault-tolerance demo: worker {FAILURE_VICTIM} will be "
+            f"killed {FAILURE_DELAY_S}s into the load test.\n"
+        )
+        _schedule_failure(worker_procs, FAILURE_DELAY_S, FAILURE_VICTIM)
 
-    # 5. Run the load test. This is the part the rubric cares about.
+    # ------------------------------------------------------------------
+    # 5. Run the load test
+    # ------------------------------------------------------------------
     try:
         run_load_test(
             scheduler,
@@ -91,15 +208,35 @@ def main():
             warmup=True,
         )
     finally:
-        # Always print the scheduler-side report and stop the heartbeat,
-        # even if the test crashed mid-way.
-        print("[Scheduler report]", scheduler.report())
-        # Show the final health of each worker (proves whether the
-        # fault-tolerance simulation actually killed someone).
-        print("[Worker health]", {
-            w.id: ("UP" if w.is_healthy() else "DOWN") for w in workers
-        })
+        # Always print final reports even if the test raised
+        print("\n[Scheduler report]")
+        for k, v in scheduler.report().items():
+            print(f"  {k:20s}: {v}")
+
+        print("\n[Worker health]")
+        for wid, info in scheduler.worker_summary().items():
+            status = "UP  " if info["healthy"] else "DOWN"
+            print(
+                f"  worker {wid} [{status}] {info['url']}  "
+                f"active={info['active_requests']}  "
+                f"avg_lat={info['avg_latency_s']:.3f}s"
+            )
+
         scheduler.stop()
+
+        # ------------------------------------------------------------------
+        # 6. Shut down worker processes
+        # ------------------------------------------------------------------
+        print("\n[Main] Shutting down worker processes …")
+        for i, proc in enumerate(worker_procs):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in worker_procs:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        print("[Main] All workers stopped. Done.")
 
 
 if __name__ == "__main__":

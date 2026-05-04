@@ -1,0 +1,43 @@
+Retrieval-Augmented Generation (RAG) and Large Language Models
+
+Retrieval-Augmented Generation (RAG) is a technique that enhances large language models by giving them access to external knowledge at inference time. Instead of relying solely on parameters learned during training, a RAG system retrieves relevant passages from a corpus and provides them as context to the model when generating a response. This makes the model's answers more accurate, current, and grounded in verifiable sources.
+
+The RAG Pipeline
+
+A standard RAG pipeline consists of three stages: indexing, retrieval, and generation. During indexing, documents are split into chunks, converted to dense vector embeddings using an embedding model, and stored in a vector database. During retrieval, the user's query is embedded using the same model, and the most semantically similar document chunks are retrieved via approximate nearest neighbor search. During generation, the retrieved chunks are concatenated with the query into a prompt, which the language model uses to generate a grounded answer.
+
+Why RAG Outperforms Pure Parametric Models
+
+Language models store knowledge in their weights, but this knowledge is frozen at training time. RAG allows the model to access current information—recent news, updated documentation, private knowledge bases—without retraining. RAG also reduces hallucination: when the model is given retrieved context that contains the answer, it is much less likely to fabricate incorrect information. Finally, RAG improves interpretability because the retrieved sources can be surfaced to users for verification.
+
+Text Embeddings and Vector Representations
+
+An embedding model maps a piece of text to a fixed-size dense vector in a high-dimensional space (typically 384 to 4096 dimensions). Semantically similar texts are mapped to nearby vectors. The sentence-transformers library provides pre-trained models fine-tuned specifically for semantic similarity. The all-MiniLM-L6-v2 model produces 384-dimensional embeddings and achieves strong performance at roughly 80MB, making it efficient enough for CPU inference. Larger models like text-embedding-3-large from OpenAI produce 3072-dimensional vectors and offer higher recall on complex queries.
+
+Similarity Metrics
+
+Cosine similarity measures the angle between two vectors and is the most widely used metric for text embeddings. Two vectors with cosine similarity of 1.0 point in exactly the same direction, while orthogonal vectors have similarity 0. For unit-normalized vectors, cosine similarity equals the dot product, which is faster to compute. Euclidean distance (L2) is another option but is less appropriate for high-dimensional text embeddings because it conflates magnitude with direction. Maximum Inner Product Search (MIPS) is used when vectors are not normalized and we want to find the vector with the highest dot product.
+
+Chunking Strategies
+
+How documents are divided into chunks significantly affects retrieval quality. Fixed-size chunking splits text into overlapping windows of a fixed word or token count. Sentence-aware chunking respects sentence boundaries. Semantic chunking groups sentences by semantic similarity. Recursive character splitting—used by LangChain—tries paragraph boundaries first, then sentence boundaries, then words, ensuring chunks stay under a size limit while preserving semantic units. The optimal chunk size depends on the embedding model's context window, the nature of the documents, and whether queries tend to match single facts or longer passages.
+
+Vector Databases
+
+Vector databases are optimized for storing and searching dense vectors at scale. FAISS (Facebook AI Similarity Search) is a library offering both exact and approximate search algorithms. Exact search (IndexFlatIP for inner product, IndexFlatL2 for L2 distance) is accurate but O(n) per query. Approximate methods like IVF (Inverted File Index) partition vectors into clusters and only search within the closest clusters, reducing query time dramatically at the cost of some recall. HNSW (Hierarchical Navigable Small World graphs) is a graph-based ANN algorithm that achieves high recall with low latency and is used in Qdrant, Weaviate, and Chroma. Pinecone and Weaviate add metadata filtering, hybrid search (dense + sparse BM25), and managed infrastructure.
+
+Hybrid Search: Dense + Sparse
+
+Dense retrieval (embedding-based) excels at semantic similarity but can miss exact keyword matches. Sparse retrieval—BM25, TF-IDF—excels at keyword matching but misses paraphrases. Hybrid search combines both by running dense and sparse retrieval in parallel and fusing the ranked lists. Reciprocal Rank Fusion (RRF) is a simple but effective fusion method that assigns scores based on each document's rank in each list rather than the raw scores. Modern retrieval systems often default to hybrid search for robustness.
+
+Re-ranking
+
+The initial retrieval step returns a candidate set efficiently but may not perfectly rank the documents by relevance. A cross-encoder re-ranker processes each (query, document) pair jointly, allowing full attention between query and document tokens. This is more accurate than bi-encoder retrieval (which encodes query and document independently) but slower, making it practical only for re-ranking a small top-k set. Models like Cohere Rerank and BGE-reranker are widely used in production RAG pipelines.
+
+Advanced RAG Patterns
+
+Multi-hop RAG breaks complex questions into sub-questions, retrieves evidence for each, and chains the results together. Iterative RAG (also called Self-RAG) lets the model decide when to retrieve, whether retrieved passages are relevant, and whether its generated answer is grounded. HyDE (Hypothetical Document Embeddings) generates a hypothetical answer to the query first, embeds it, and uses that embedding for retrieval—often retrieving more relevant documents than embedding the raw question. Contextual compression uses a secondary model to extract only the relevant sentences from each retrieved chunk before adding it to the prompt, reducing noise.
+
+RAG Evaluation Metrics
+
+Evaluating a RAG system requires measuring both retrieval quality and generation quality. Retrieval metrics include Recall@k (fraction of relevant documents in the top-k results), Precision@k, and NDCG. Generation metrics include faithfulness (does the answer contain only claims supported by the retrieved context?), answer relevance (does the answer address the question?), and context relevance (are the retrieved passages actually useful?). RAGAS is a popular framework that computes these metrics automatically using an LLM as a judge.

@@ -2,80 +2,180 @@
 
 **Title:** Efficient Load Balancing and GPU Cluster Task Distribution for Handling 1000+ Concurrent LLM Requests.
 
-A distributed system that takes concurrent user requests, runs them through a real RAG + LLM pipeline, and dynamically distributes the work across multiple simulated GPU worker nodes. Includes three load-balancing strategies, fault tolerance with automatic failover, and full performance metrics.
+A **real** distributed system: multiple worker processes communicate over genuine TCP sockets, the RAG pipeline ingests real documents from disk and searches a persisted vector index, and the LLM generates actual text. Nothing is simulated.
 
-## Folder structure
+---
+
+## Architecture
+
+```
+         ┌─────────────────────────────────────────┐
+         │            Client (load test)            │
+         │  ThreadPoolExecutor → Scheduler          │
+         └───────────────────┬─────────────────────┘
+                             │ handle_request()
+                    ┌────────▼────────┐
+                    │   Scheduler     │  ← heartbeat: GET /health every 5s
+                    └────────┬────────┘
+                             │ dispatch()
+                    ┌────────▼────────┐
+                    │  Load Balancer  │  round_robin | least_connections
+                    │  (httpx client) │  | load_aware
+                    └──┬───┬───┬──┬───┘
+                       │   │   │  │  real HTTP POST /process
+              ┌────────┘ ┌─┘ ┌─┘ └────────┐
+          :8001       :8002 :8003        :8004
+         Worker 0   Worker 1  …         Worker N
+              └──────────────┬───────────────┘
+                             │
+              ┌──────────────▼───────────────────┐
+              │  RAG Retriever                    │
+              │  sentence-transformers embed      │
+              │  sklearn NearestNeighbors search  │
+              │  rag/embeddings.npy  (disk)       │
+              └──────────────┬───────────────────┘
+                             │ retrieved context
+              ┌──────────────▼───────────────────┐
+              │  LLM: google/flan-t5-small (CPU)  │
+              └──────────────────────────────────┘
+```
+
+## Folder Structure
 
 ```
 Distributed_Project/
-├── main.py                  - entry point; edit knobs at the top to run experiments
-├── requirements.txt         - Python dependencies
+├── main.py                      entry point: spawn workers → run load test
+├── ingest.py                    one-time: chunk docs, embed, save index
+├── requirements.txt
 ├── README.md
 │
-├── client/
-│   └── load_generator.py    - simulates N concurrent users with ThreadPoolExecutor
-│
-├── lb/
-│   └── load_balancer.py     - Round Robin / Least Connections / Load-aware
-│
-├── master/
-│   └── scheduler.py         - controller, aggregate metrics, heartbeat
-│
-├── workers/
-│   └── gpu_worker.py        - simulated GPU node (real RAG + real LLM)
-│
-├── llm/
-│   └── inference.py         - real flan-t5-small inference (lazy + thread-safe)
+├── docs/                        real knowledge documents (5 × .txt)
+│   ├── distributed_systems.txt
+│   ├── rag_and_llms.txt
+│   ├── load_balancing.txt
+│   ├── fault_tolerance.txt
+│   └── llm_inference.txt
 │
 ├── rag/
-│   ├── retriever.py         - sentence-transformers + cosine similarity
-│   └── knowledge_base.py    - in-memory KB documents
+│   ├── document_loader.py       load + chunk .txt/.pdf files
+│   ├── indexer.py               embed chunks → sklearn NearestNeighbors
+│   │                            persist to rag/embeddings.npy + rag/chunks.pkl
+│   ├── retriever.py             load index from disk, serve kNN queries
+│   └── knowledge_base.py        (kept for reference)
+│
+├── workers/
+│   ├── worker_server.py         real HTTP server (ThreadingHTTPServer)
+│   │                            GET /health  GET /metrics  POST /process
+│   └── gpu_worker.py            (kept for reference — original in-process version)
+│
+├── lb/
+│   └── load_balancer.py         WorkerProxy (httpx) + LoadBalancer (3 strategies)
+│
+├── master/
+│   └── scheduler.py             metrics + heartbeat (pings /health HTTP endpoint)
+│
+├── client/
+│   └── load_generator.py        ThreadPoolExecutor load test + summary report
+│
+├── llm/
+│   └── inference.py             flan-t5-small inference (lazy, thread-safe)
 │
 └── common/
-    └── models.py            - Request / Response dataclasses
+    └── models.py                Request / Response dataclasses
 ```
+
+---
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
+# Activate the existing venv (Python 3.14)
 source .venv/bin/activate
-pip install -r requirements.txt
+
+# All dependencies are already installed in the venv.
+# If you start fresh: pip install -r requirements.txt
 ```
 
-First run downloads two models (one-time):
-- `google/flan-t5-small` (~308MB) for LLM inference
-- `sentence-transformers/all-MiniLM-L6-v2` (~80MB) for RAG embeddings
+First run will download two models (one-time, cached to ~/.cache/huggingface/):
+- `sentence-transformers/all-MiniLM-L6-v2` (~80 MB) — for embeddings
+- `google/flan-t5-small` (~308 MB) — for LLM inference
+
+---
 
 ## Run
+
+### Step 1 — Build the vector index (one-time)
+
+```bash
+python ingest.py
+```
+
+This reads the 5 documents in `docs/`, splits them into ~200-word chunks,
+embeds each chunk with sentence-transformers, and saves the index to
+`rag/embeddings.npy` and `rag/chunks.pkl`.
+
+To add your own documents: drop `.txt` (or `.pdf` if pypdf is installed)
+files into `docs/` and re-run `ingest.py`.
+
+### Step 2 — Start the distributed system and run the load test
 
 ```bash
 python main.py
 ```
 
-Edit the CONFIG block at the top of `main.py` to change strategy, worker count, user count, or toggle the failure simulation.
+This:
+1. Spawns `NUM_WORKERS` independent worker server processes (ports 8001–8004)
+2. Waits for all workers to respond to `GET /health`
+3. Runs a load test with `NUM_USERS` concurrent requests
+4. Prints latency, throughput, per-worker breakdown
+5. Shuts down all worker processes cleanly
 
-## Experiments to run for the report
+### Step 3 — Try a single query manually (optional)
 
-| Experiment | What to change |
-|---|---|
-| Strategy comparison | Set `STRATEGY` to each of `round_robin`, `least_connections`, `load_aware`. Compare throughput + per-worker breakdown. |
-| Scaling test | Run with `NUM_USERS = 100, 250, 500, 1000` and plot throughput vs. users. |
-| Fault tolerance | Run with `SIMULATE_FAILURE = True` and verify success rate is still 100% and the killed worker handled fewer requests. |
-| Worker count sweep | Run with `NUM_WORKERS = 1, 2, 4, 8`. Shows scalability. |
+```bash
+# In one terminal: start a single worker
+python -m workers.worker_server --port 8001 --worker-id 0
 
-## What's implemented
+# In another terminal: send a request
+curl -s -X POST http://localhost:8001/process \
+  -H "Content-Type: application/json" \
+  -d '{"id": 1, "query": "How does least connections routing work?"}' | python -m json.tool
+```
 
-- Round Robin, Least Connections, and Load-aware load balancing
-- Real LLM inference (flan-t5-small) — not a sleep stub
-- Real RAG retrieval with sentence embeddings + cosine similarity
-- Scheduler with aggregate metrics and background heartbeat
-- ThreadPoolExecutor-based concurrent load generator
-- Fault tolerance: per-worker health flags, dispatch-level retry, dead-node simulation
-- p95 latency + per-worker request distribution in the summary
+---
 
-## Limitations
+## Configuration (edit main.py)
 
-- Workers run as threads in one Python process. The interfaces (`process()`, `is_healthy()`, `heartbeat()`) are designed so each worker can be moved across the network later without changing the rest of the system.
-- LLM inference is serialized by a lock (modeling a single GPU). For multi-GPU you would load one model per worker.
-- The knowledge base is small (20 documents). Swap `rag/retriever.py` for a FAISS index when scaling up.
+| Variable | Default | Effect |
+|---|---|---|
+| `NUM_WORKERS` | `4` | Number of real worker processes |
+| `NUM_USERS` | `100` | Total requests in the load test |
+| `MAX_CONCURRENCY` | `20` | Max simultaneous in-flight HTTP requests |
+| `STRATEGY` | `"load_aware"` | Routing algorithm |
+| `SIMULATE_FAILURE` | `True` | Kill one worker mid-test |
+| `FAILURE_VICTIM` | `1` | Which worker index (0-based) to kill |
+
+---
+
+## Experiments for the Report
+
+| Experiment | What to change | What to measure |
+|---|---|---|
+| Strategy comparison | `STRATEGY = "round_robin"` / `"least_connections"` / `"load_aware"` | Throughput, avg latency, per-worker distribution |
+| Scaling test | `NUM_USERS = 10, 50, 100, 200` | Wall time, throughput (req/s) |
+| Fault tolerance | `SIMULATE_FAILURE = True` | Success rate stays 100%; killed worker shows fewer requests |
+| Worker count | `NUM_WORKERS = 1, 2, 4` | Throughput scales with workers |
+
+---
+
+## What Changed (Simulation → Real System)
+
+| Component | Simulation (before) | Real System (now) |
+|---|---|---|
+| Workers | Python objects in same process | Independent OS processes |
+| Communication | Method calls | Real HTTP over TCP (httpx) |
+| Health checking | Boolean flag | HTTP `GET /health` over network |
+| Knowledge base | 20 hardcoded strings | 5 real documents in `docs/` |
+| Document ingestion | None | `ingest.py` chunks & embeds files |
+| Vector index | Numpy matrix rebuilt every run | sklearn NearestNeighbors persisted to disk |
+| Retrieval | Brute-force numpy matmul | kNN search with source attribution |

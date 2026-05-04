@@ -1,0 +1,43 @@
+LLM Inference: Architecture, Optimization, and Serving at Scale
+
+Large Language Model (LLM) inference is the process of generating output text from a trained model given an input prompt. Unlike training—which updates model weights and runs once—inference is repeated billions of times per day at hyperscale providers. The computational demands of inference are dominated by the transformer architecture's attention mechanism and the need to load hundreds of billions of model parameters for every request.
+
+The Transformer Architecture and Inference Cost
+
+Modern LLMs are built on the transformer architecture, introduced in "Attention Is All You Need" (Vaswani et al., 2017). A transformer stacks layers of multi-head self-attention and feed-forward networks. At inference time, each generated token requires a forward pass through all layers. The computational cost of a forward pass is approximately 2 * P FLOPs, where P is the number of parameters. For a 70B-parameter model, this is ~140 billion floating-point operations per token. At 16-bit precision on an A100 GPU capable of 312 TFLOPS, a single token takes about 0.45ms—meaning a 1000-token response takes about 450ms on a single GPU, not accounting for memory bandwidth bottlenecks.
+
+Memory Bandwidth as the Real Bottleneck
+
+For small batch sizes (which is common for interactive chatbots), inference is memory-bandwidth-bound rather than compute-bound. Each token generation requires loading the full model weights from GPU HBM (High-Bandwidth Memory) to the compute units. A 70B model in 16-bit precision occupies 140GB—far more than a single A100's 80GB. The GPU's memory bandwidth (typically 1-2 TB/s for modern A100/H100) becomes the limiting factor: loading 140GB at 2TB/s takes 70ms per token, giving a ceiling of ~14 tokens/second regardless of how fast the compute units are.
+
+KV Cache
+
+During autoregressive generation, each new token attends to all previous tokens in the context. Without caching, recomputing attention over the entire context for each new token would be O(n²) in the sequence length n. The KV (key-value) cache stores the attention keys and values for all previously processed tokens so each new token only computes attention over the cached context incrementally. The KV cache grows linearly with sequence length and batch size. For a 70B model with 80 attention layers and a 4096-token context, each token in the batch occupies ~0.5MB of KV cache. Efficiently managing the KV cache is essential for high-throughput serving.
+
+Batching and Continuous Batching
+
+Batching—processing multiple requests simultaneously—amortizes the cost of loading model weights across many requests, dramatically improving throughput. With a batch size of 32, throughput can be 32x higher than single-request processing. Static batching groups requests into fixed-size batches and waits for all to complete before starting the next batch, which wastes GPU time when some requests finish early. Continuous batching (also called dynamic batching or iteration-level scheduling) slots new requests into the batch at every decode step, keeping the GPU continuously busy. vLLM and Orca implement continuous batching and achieve 2-4x higher throughput than static batching.
+
+PagedAttention and vLLM
+
+The KV cache's memory is typically allocated in large contiguous blocks per sequence, leading to fragmentation and wasted memory. vLLM introduced PagedAttention, which stores KV cache in non-contiguous pages (like virtual memory pages in an OS), allocating pages on demand. This eliminates internal fragmentation and allows sequences of different lengths to share GPU memory efficiently. PagedAttention enables vLLM to serve 2-4x more concurrent requests than frameworks with contiguous KV cache allocation, at the same batch throughput.
+
+Quantization
+
+Quantization reduces the precision of model weights and/or activations from 32-bit or 16-bit floating point to 8-bit integers (INT8) or 4-bit integers (INT4). This reduces memory footprint (a 70B model fits on a single A100 at INT4) and can increase throughput because INT8 matrix multiplications run faster than FP16 on hardware that supports them. Weight-only quantization (like GPTQ, AWQ) quantizes the stored weights but dequantizes them back to FP16 for computation, saving memory without the numerical risk of fully quantized activations. LLM.int8() from bitsandbytes performs per-row dynamic quantization of activations at inference time.
+
+Tensor Parallelism and Pipeline Parallelism
+
+When a model is too large for a single GPU, it must be distributed across multiple GPUs. Tensor parallelism splits individual tensors (weight matrices) across GPUs, with each GPU computing a shard of each layer's output and then synchronizing via all-reduce before the next layer. This keeps all GPUs busy at every layer but requires high-bandwidth GPU interconnect (NVLink). Pipeline parallelism assigns different layers to different GPUs, passing activations between them. This reduces communication but leaves GPUs idle waiting for predecessors (the pipeline bubble). Megatron-LM and DeepSpeed support both strategies and can combine them for very large models.
+
+Speculative Decoding
+
+Autoregressive decoding is inherently sequential: each token depends on all previous tokens. Speculative decoding breaks this sequential dependency. A small draft model generates K tokens quickly, and the large target model verifies all K tokens in a single forward pass (because verification is parallelizable unlike generation). If the large model accepts all K tokens, generation jumps ahead by K steps. If it rejects some tokens, it corrects from the first rejection and the draft model tries again. With an acceptance rate of ~80%, speculative decoding achieves 2-3x speedup while producing output identical to pure target-model decoding.
+
+Serving Frameworks and Infrastructure
+
+Production LLM serving requires more than just model inference. vLLM is the leading open-source serving framework, offering continuous batching, PagedAttention, speculative decoding, and an OpenAI-compatible API. TGI (Text Generation Inference) by Hugging Face offers similar features. TensorRT-LLM from NVIDIA optimizes models specifically for NVIDIA hardware. For multi-model serving, Triton Inference Server manages loading, versioning, and GPU sharing across many models. In Kubernetes-based deployments, operators like KubeAI and KServe automate model loading, autoscaling, and rolling upgrades, treating ML models as first-class Kubernetes resources.
+
+FLAN-T5 and Instruction Tuning
+
+FLAN-T5 is a family of models from Google Research that are encoder-decoder transformers fine-tuned on a large collection of NLP tasks phrased as natural language instructions (FLAN = Fine-tuned Language Net). Unlike decoder-only models (GPT family), encoder-decoder models like T5 encode the full input context before generating output, which can improve coherence for tasks like question answering and summarization. FLAN-T5-Small has approximately 80 million parameters, runs on CPU with modest RAM, and produces sensible answers to factual questions—making it an ideal model for demonstrating distributed inference infrastructure without requiring GPU hardware.

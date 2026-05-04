@@ -1,0 +1,43 @@
+Fault Tolerance in Distributed Systems: Patterns and Mechanisms
+
+Fault tolerance is the property of a system that allows it to continue operating correctly in the presence of hardware failures, software bugs, network partitions, and other unexpected failures. In a distributed system running on commodity hardware, individual component failures are not exceptional events—they are the expected norm. Google's internal papers report that in a cluster of 1000 machines, hardware failures (disk failures, memory errors, network outages) occur daily. Designing for fault tolerance means treating failures as first-class citizens, not edge cases.
+
+Types of Failures
+
+Crash failures occur when a component stops executing entirely. This is the simplest failure type because the component gives no misleading responses—it simply goes silent. Omission failures occur when a component fails to send or receive messages, even though it is still running. Performance failures occur when a component responds too slowly, violating timing assumptions. Byzantine failures are the most severe: a component produces incorrect, arbitrary, or even malicious responses. Most commercial distributed systems are designed to tolerate only crash and omission failures; tolerating Byzantine failures requires more expensive algorithms like PBFT or Tendermint.
+
+Redundancy and Replication
+
+The primary mechanism for fault tolerance is redundancy: running multiple copies of every critical component so the system can survive individual failures. For stateless services, running N identical replicas behind a load balancer means the system can tolerate N-1 failures while still serving all traffic. For stateful services (databases, caches), active-passive replication keeps a primary and one or more standby replicas that receive the same writes. On primary failure, one standby is promoted. Active-active replication allows all replicas to serve reads and writes simultaneously, providing higher throughput but requiring conflict resolution logic.
+
+Heartbeats and Failure Detection
+
+Distributed components use heartbeat messages to detect when peers have failed. A heartbeat is a periodic "I am alive" signal sent over the network. If a node misses K consecutive heartbeats from a peer, it declares that peer failed and triggers recovery procedures (e.g., electing a new leader, reassigning pending tasks). The heartbeat interval and failure threshold control the trade-off between detection latency and false positives. In a system with high network jitter, too aggressive a threshold will cause healthy nodes to be incorrectly declared dead (false positives). The Phi Accrual Failure Detector, used in Cassandra and Akka, estimates the probability that a node has failed based on the distribution of recent heartbeat inter-arrival times, rather than using a fixed threshold.
+
+Leader Election
+
+Many distributed algorithms require exactly one node to act as coordinator (the "leader"). Zab (used in ZooKeeper), Raft (used in etcd), and Paxos all incorporate leader election. In Raft, each node starts as a follower. If a follower does not receive a heartbeat from a leader within an election timeout, it becomes a candidate and solicits votes. A candidate wins if it receives votes from a majority of nodes. The elected leader then sends heartbeats to prevent new elections. Split-brain—where two nodes both believe they are the leader—is prevented by requiring a strict majority (quorum) for election.
+
+Task Reassignment and Checkpointing
+
+In systems that distribute computational work across worker nodes, a crashed worker will have its in-progress tasks abandoned. The master scheduler must detect the crash (via heartbeat timeout), identify all tasks assigned to the dead worker, and reassign them to healthy workers. To avoid duplicating work, tasks should be idempotent (safe to retry) or should checkpoint their progress at regular intervals. Checkpointing writes the current intermediate state to durable storage (like S3 or HDFS) so that a rescheduled task can resume from the latest checkpoint rather than starting over. MapReduce, Spark, and Ray all implement checkpointing for exactly this reason.
+
+Bulkhead Pattern
+
+The bulkhead pattern (named after ship bulkheads that contain flooding to a single compartment) isolates failures by partitioning resources. In a microservices system, if Service A calls Service B and Service B becomes slow, Service A could exhaust its connection pool waiting for B, causing a cascading failure that brings down A as well. Bulkheads prevent this by giving each external dependency its own connection pool and thread pool. If Service B's pool is exhausted, requests to B are rejected immediately rather than blocking and consuming Service A's general resources.
+
+Saga Pattern for Distributed Transactions
+
+Traditional two-phase commit is too fragile for microservices (requires all participants to be available). The Saga pattern replaces distributed transactions with a sequence of local transactions, each publishing an event or message to trigger the next step. If a step fails, a sequence of compensating transactions is executed to undo the prior steps. Sagas can be orchestrated (a central saga orchestrator tells each service what to do) or choreographed (each service reacts to events and emits new events). The Saga pattern trades strict atomicity for availability and independence, which is usually the right trade-off in loosely coupled microservices.
+
+Idempotency
+
+An operation is idempotent if applying it multiple times produces the same result as applying it once. Idempotency is critical for safe retries in distributed systems. HTTP GET, HEAD, and DELETE are idempotent. HTTP POST is not by default, but can be made idempotent by including a client-generated idempotency key in the request. The server stores the key and result; if the same key is received again, the stored result is returned without re-executing the operation. Stripe and most payment APIs implement idempotency keys to prevent duplicate charges during network retries.
+
+Timeouts, Deadlines, and Backpressure
+
+Every network call in a distributed system must have a timeout, or a slow remote service can hang the caller indefinitely. Deadlines propagate a maximum allowed duration across all service calls in a request chain: if a user has 500ms total budget and service A takes 200ms, the remaining 300ms deadline is forwarded to service B. gRPC natively supports deadline propagation. Backpressure signals that a consumer is overwhelmed and producers should slow down. Reactive streams, TCP's sliding window, and Kafka consumer lag are all forms of backpressure. Ignoring backpressure leads to cascading failures as buffers fill up and memory is exhausted.
+
+Chaos Engineering
+
+Chaos engineering is the discipline of intentionally injecting failures into production systems to find weaknesses before they cause real outages. Netflix's Chaos Monkey randomly terminates EC2 instances in production. Chaos Monkey for Kubernetes (from Chaos Mesh or Litmus) injects pod kills, network partitions, latency, and CPU stress into Kubernetes clusters. Game days are scheduled exercises where teams deliberately trigger failure scenarios and verify that recovery procedures work correctly. The outcome of a chaos experiment is either confidence that the system is resilient, or a discovered weakness that can be fixed proactively.

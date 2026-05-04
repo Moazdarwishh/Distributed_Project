@@ -1,10 +1,22 @@
-# Real but lightweight LLM (flan-t5-small, ~308MB, CPU-friendly)
+# ─── LLM inference (flan-t5-small, ~308MB, CPU-friendly) ─────────────────────
 transformers>=4.40.0
 torch>=2.0.0
-sentencepiece>=0.1.99    # required by the T5 tokenizer
+sentencepiece>=0.1.99          # required by the T5 tokenizer
 
-# Real RAG retriever (all-MiniLM-L6-v2, ~80MB embedding model)
+# ─── RAG — embeddings ─────────────────────────────────────────────────────────
 sentence-transformers>=2.5.0
+
+# ─── RAG — vector index (sklearn NearestNeighbors, already in venv) ───────────
+scikit-learn>=1.3.0
 numpy>=1.24.0
 
-# (later steps add no new heavy deps)
+# ─── HTTP worker servers (Python stdlib ThreadingHTTPServer — no extra dep) ───
+
+# ─── HTTP load balancer / client ──────────────────────────────────────────────
+httpx>=0.25.0
+
+# ─── PDF ingestion (optional — only needed if you add .pdf files to docs/) ────
+# pypdf>=3.0.0
+
+# ─── Dev / testing ────────────────────────────────────────────────────────────
+# pytest>=7.0.0

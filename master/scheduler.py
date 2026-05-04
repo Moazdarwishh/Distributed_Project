@@ -1,111 +1,162 @@
 """
-Master Scheduler / Controller.
+Master Scheduler / Controller — HTTP-aware.
 
-This is the single front door of the system. The client doesn't talk to
-the load balancer directly — it talks to a Scheduler instance. The
-Scheduler owns three responsibilities the load balancer alone shouldn't:
+The Scheduler is the single front door of the distributed system.
+Clients call handle_request(); the Scheduler routes through the
+LoadBalancer (which in turn fires real HTTP requests to worker processes).
 
-  1. Aggregate metrics across all requests (totals, success rate, latency).
-     The load balancer routes one request at a time and shouldn't have
-     to know about "the whole load test."
+Responsibilities
+----------------
+1. Aggregate metrics — totals, success/failure counts, latency stats.
+2. Background heartbeat thread — periodically calls worker.heartbeat()
+   which pings the real GET /health HTTP endpoint on each worker.
+   Silent failures (crashed processes) are caught here even if no
+   request happens to be in-flight at that moment.
+3. Clean lifecycle — stop() shuts down the heartbeat so the process
+   can exit cleanly.
 
-  2. A background heartbeat thread that periodically checks each worker.
-     This is what catches silent failures - workers that died without
-     raising an exception during a process() call.
-
-  3. A clean lifecycle: stop() shuts the heartbeat down so the program
-     can exit cleanly after a test run.
+Changes from the simulation version
+-------------------------------------
+- The heartbeat now triggers real HTTP health checks (via WorkerProxy).
+- Failed workers that recover can be re-detected as healthy by the
+  heartbeat (mark_healthy is called on a successful ping).
+- report() adds p50 / p95 latency percentiles.
 """
 
 import threading
 import time
+from statistics import median
+from typing import List
 
 from common.models import Request, Response
 
 
+def _percentile(values: list, p: float) -> float:
+    """Stdlib-only percentile (no numpy dependency here)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
 class Scheduler:
-    def __init__(self, load_balancer, heartbeat_interval: float = 2.0):
-        self.lb = load_balancer
-        self.heartbeat_interval = heartbeat_interval
+    """
+    Routes requests through the LoadBalancer and owns the heartbeat loop.
 
-        # --- aggregate metrics (read by client / report()) ---
-        self._metrics_lock = threading.Lock()
-        self.total_requests = 0
-        self.successful = 0
-        self.failed = 0
-        self.total_latency = 0.0     # sum of latencies of *successful* requests
+    Args:
+        load_balancer:       a LoadBalancer instance wrapping WorkerProxy objects
+        heartbeat_interval:  seconds between health check rounds (default: 5s)
+    """
 
-        # --- heartbeat thread ---
-        # Event = a thread-safe boolean we can flip from another thread.
-        # The heartbeat loop checks it every iteration so it can exit promptly.
-        self._stop = threading.Event()
+    def __init__(self, load_balancer, heartbeat_interval: float = 5.0):
+        self.lb                  = load_balancer
+        self.heartbeat_interval  = heartbeat_interval
+
+        # --- Aggregate metrics ---
+        self._metrics_lock   = threading.Lock()
+        self.total_requests  = 0
+        self.successful      = 0
+        self.failed          = 0
+        self._latencies: List[float] = []   # all successful latencies (for percentiles)
+
+        # --- Heartbeat ---
+        self._stop      = threading.Event()
         self._hb_thread = threading.Thread(
             target=self._heartbeat_loop,
-            daemon=True,           # dies with the program if not stopped explicitly
+            daemon=True,
             name="scheduler-heartbeat",
         )
         self._hb_thread.start()
 
-    # ------------------------------------------------------------------
-    # Public API used by the client / load generator
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
     def handle_request(self, request: Request) -> Response:
-        """Process one request end-to-end and update aggregate metrics."""
+        """Dispatch one request and record aggregate metrics."""
         response = self.lb.dispatch(request)
 
         with self._metrics_lock:
             self.total_requests += 1
             if response.success:
                 self.successful += 1
-                self.total_latency += response.latency
+                self._latencies.append(response.latency)
             else:
                 self.failed += 1
 
         return response
 
     def report(self) -> dict:
-        """Snapshot of the metrics. Safe to call any time."""
+        """
+        Snapshot of aggregate metrics.
+
+        Returns a dict with:
+            total, success, failed, success_rate,
+            avg_latency_s, p50_latency_s, p95_latency_s
+        """
         with self._metrics_lock:
-            avg = (
-                self.total_latency / self.successful
-                if self.successful else 0.0
-            )
-            return {
-                "total": self.total_requests,
-                "success": self.successful,
-                "failed": self.failed,
-                "avg_latency_s": round(avg, 4),
-                "success_rate": (
-                    round(self.successful / self.total_requests, 4)
-                    if self.total_requests else 0.0
-                ),
+            n   = self.successful
+            lats = list(self._latencies)
+
+        avg = sum(lats) / n if n else 0.0
+        p50 = _percentile(lats, 0.50)
+        p95 = _percentile(lats, 0.95)
+
+        total = self.total_requests
+        return {
+            "total":          total,
+            "success":        self.successful,
+            "failed":         self.failed,
+            "success_rate":   round(self.successful / total, 4) if total else 0.0,
+            "avg_latency_s":  round(avg, 4),
+            "p50_latency_s":  round(p50, 4),
+            "p95_latency_s":  round(p95, 4),
+        }
+
+    def worker_summary(self) -> dict:
+        """Return health and load snapshot for each worker proxy."""
+        summary = {}
+        for w in self.lb.workers:
+            summary[w.id] = {
+                "url":             w.url,
+                "healthy":         w.is_healthy(),
+                "active_requests": w.active_requests(),
+                "avg_latency_s":   round(w.avg_latency(), 4),
             }
+        return summary
 
     def stop(self):
-        """Signal the heartbeat thread to exit. Call at program shutdown."""
+        """Signal the heartbeat thread to exit and close HTTP clients."""
         self._stop.set()
+        self._hb_thread.join(timeout=self.heartbeat_interval + 1)
+        self.lb.close()
 
-    # ------------------------------------------------------------------
-    # Background heartbeat — fault detection
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Background heartbeat loop
+    # -----------------------------------------------------------------------
+
     def _heartbeat_loop(self):
         """
-        Periodically poke every worker so silent failures get noticed.
+        Periodically ping every worker's /health endpoint.
 
-        Without this, a worker that dies in a way that *doesn't* raise
-        (e.g. it stops responding but its process is still alive in some
-        future networked version) would only be discovered the next time
-        a request is dispatched to it. The heartbeat catches it sooner
-        and gives the load balancer a chance to skip it proactively.
+        - Workers that fail to respond are marked unhealthy, taking them
+          out of the routing pool until they recover.
+        - Workers that recover (return 200 again) are automatically
+          re-admitted into the pool (mark_healthy is called inside
+          WorkerProxy.heartbeat()).
+        - The loop uses Event.wait() rather than time.sleep() so stop()
+          wakes it up immediately.
         """
         while not self._stop.is_set():
-            for w in self.lb.workers:
-                # In the current single-process simulation, heartbeat()
-                # just returns the worker's current health flag. When you
-                # later move workers across the network, this becomes a
-                # real ping / RPC call with a timeout.
-                w.heartbeat()
-            # Event.wait returns early if stop() is called - cleaner than
-            # time.sleep() because we don't have to wait the full interval
-            # before the program can exit.
+            for worker in self.lb.workers:
+                alive = worker.heartbeat()
+                status = "UP" if alive else "DOWN"
+                print(
+                    f"[Heartbeat] worker {worker.id} @ {worker.url} → {status}"
+                )
             self._stop.wait(self.heartbeat_interval)
